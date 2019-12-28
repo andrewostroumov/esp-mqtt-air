@@ -1,0 +1,1 @@
+idf_component_register(SRCS "driver/bme280.c" INCLUDE_DIRS "driver")
