@@ -18,11 +18,12 @@
 #include "esp_tls.h"
 #include "mqtt_client.h"
 #include "driver/i2c.h"
+#include "driver/uart.h"
 
 #include "bsec_integration.h"
 #include "bsec_serialized_configurations_iaq.h"
 
-static QueueHandle_t esp_air_queue;
+static QueueHandle_t esp_air_queue, esp_uart_co_queue, esp_uart_co2_queue;
 static EventGroupHandle_t wifi_event_group, mqtt_event_group, esp_event_group;
 static esp_mqtt_client_handle_t client;
 
@@ -49,9 +50,46 @@ enum AIR_QUALITY_INDEX {
     AIR_QUALITY_HAZARDOUS,
 };
 
+enum CO2_INDEX {
+    CO2_NULL,
+    CO2_GOOD,
+    CO2_MODERATE,
+    CO2_UNHEALTHY,
+    CO2_HAZARDOUS,
+};
+
+#define CO_GAS_TYPE_BYTE  1
+#define CO_HIGH_BYTE      4
+#define CO_LOW_BYTE       5
+#define CO_CHECK_SUM_BYTE 8
+#define CO_MESSAGE_LENGTH 9
+#define CO_TYPE           0x04
+
+#define CO2_SENSOR_BYTE    1
+#define CO2_CHECK_SUM_BYTE 8
+#define CO2_HIGH_BYTE      2
+#define CO2_LOW_BYTE       3
+#define CO2_MESSAGE_LENGTH 9
+#define CO2_TYPE           0x86
+
+#define UART_CO_BAUD_RATE              9600
+#define UART_CO_BUF_SIZE               256
+#define UART_CO_QUEUE_SIZE             128
+
+#define UART_CO_TXD   23
+#define UART_CO_RXD   22
+
+#define UART_CO2_BAUD_RATE              9600
+#define UART_CO2_BUF_SIZE               256
+#define UART_CO2_QUEUE_SIZE             128
+
+#define UART_CO2_TXD   16
+#define UART_CO2_RXD   17
+
 #define I2C_MASTER_SCL_IO           19
 #define I2C_MASTER_SDA_IO           18
 #define I2C_MASTER_FREQ_HZ          100000
+
 #define WIFI_MAXIMUM_RETRY          15
 #define AIR_QUEUE_SIZE              1
 #define STORAGE_NAMESPACE           "storage"
@@ -68,17 +106,70 @@ typedef struct {
     double pressure;
     uint8_t iaq_accuracy;
     enum AIR_QUALITY_INDEX iaq_index;
+    enum CO2_INDEX co2_index;
     double iaq;
     double gas;
     double co2_equivalent;
     double breath_voc_equivalent;
+    double co;
+    double co2;
 } esp_air_t;
 
 esp_state_t esp_state = {};
+esp_air_t esp_air = {};
 
 int8_t user_i2c_read(uint8_t dev_id, uint8_t reg_addr, uint8_t *reg_data, uint16_t len);
 int8_t user_i2c_write(uint8_t dev_id, uint8_t reg_addr, uint8_t *reg_data, uint16_t len);
 void user_delay_ms(uint32_t period);
+
+esp_err_t uart_co_init()
+{
+    esp_err_t err;
+    uart_config_t uart_config = {
+            .baud_rate = UART_CO_BAUD_RATE,
+            .data_bits = UART_DATA_8_BITS,
+            .parity = UART_PARITY_DISABLE,
+            .stop_bits = UART_STOP_BITS_1,
+            .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+            .source_clk = UART_SCLK_APB,
+    };
+
+    err = uart_param_config(UART_NUM_1, &uart_config);
+    if (err != ESP_OK) { return err; }
+
+    err = uart_driver_install(UART_NUM_1, UART_FIFO_LEN * 2, UART_FIFO_LEN * 2, UART_CO_QUEUE_SIZE, &esp_uart_co_queue, 0);
+    if (err != ESP_OK) { return err; }
+
+    err = uart_set_pin(UART_NUM_1, UART_CO_TXD, UART_CO_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (err != ESP_OK) { return err; }
+
+    err = uart_pattern_queue_reset(UART_NUM_1, UART_CO_QUEUE_SIZE);
+    return err;
+}
+
+esp_err_t uart_co2_init()
+{
+    esp_err_t err;
+    uart_config_t uart_config = {
+            .baud_rate = UART_CO2_BAUD_RATE,
+            .data_bits = UART_DATA_8_BITS,
+            .parity = UART_PARITY_DISABLE,
+            .stop_bits = UART_STOP_BITS_1,
+            .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+
+    err = uart_param_config(UART_NUM_2, &uart_config);
+    if (err != ESP_OK) { return err; }
+
+    err = uart_driver_install(UART_NUM_2, UART_FIFO_LEN * 2, UART_FIFO_LEN * 2, UART_CO2_QUEUE_SIZE, &esp_uart_co2_queue, 0);
+    if (err != ESP_OK) { return err; }
+
+    err = uart_set_pin(UART_NUM_2, UART_CO2_TXD, UART_CO2_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (err != ESP_OK) { return err; }
+
+    err = uart_pattern_queue_reset(UART_NUM_2, UART_CO2_QUEUE_SIZE);
+    return err;
+}
 
 esp_err_t i2c_master_init()
 {
@@ -222,42 +313,54 @@ void update_esp_state(esp_state_t* state) {
     state->free_heap_size = esp_get_free_heap_size();
 }
 
-char * serialize_esp_air(esp_air_t *esp_air) {
+char * serialize_esp_air(esp_air_t *esp_air_local) {
     char *json = NULL;
     cJSON *root = cJSON_CreateObject();
 
-    if (esp_air->temperature) {
-        cJSON_AddNumberToObject(root, "temperature", floor(esp_air->temperature * 100) / 100);
+    if (esp_air_local->temperature) {
+        cJSON_AddNumberToObject(root, "temperature", floor(esp_air_local->temperature * 100) / 100);
     }
 
-    if (esp_air->humidity) {
-        cJSON_AddNumberToObject(root, "humidity", floor(esp_air->humidity * 100) / 100);
+    if (esp_air_local->humidity) {
+        cJSON_AddNumberToObject(root, "humidity", floor(esp_air_local->humidity * 100) / 100);
     }
 
-    if (esp_air->pressure) {
-        cJSON_AddNumberToObject(root, "pressure", floor(esp_air->pressure * 100) / 100);
+    if (esp_air_local->pressure) {
+        cJSON_AddNumberToObject(root, "pressure", floor(esp_air_local->pressure * 100) / 100);
     }
 
-    if (esp_air->gas) {
-        cJSON_AddNumberToObject(root, "gas", floor(esp_air->gas * 100) / 100);
+    if (esp_air_local->gas) {
+        cJSON_AddNumberToObject(root, "gas", floor(esp_air_local->gas * 100) / 100);
     }
 
-    cJSON_AddNumberToObject(root, "iaq_accuracy", esp_air->iaq_accuracy);
+    cJSON_AddNumberToObject(root, "iaq_accuracy", esp_air_local->iaq_accuracy);
 
-    if (esp_air->iaq) {
-        cJSON_AddNumberToObject(root, "iaq", floor(esp_air->iaq * 100) / 100);
+    if (esp_air_local->iaq) {
+        cJSON_AddNumberToObject(root, "iaq", floor(esp_air_local->iaq * 100) / 100);
     }
 
-    if (esp_air->iaq_index) {
-        cJSON_AddNumberToObject(root, "iaq_index", esp_air->iaq_index);
+    if (esp_air_local->iaq_index) {
+        cJSON_AddNumberToObject(root, "iaq_index", esp_air_local->iaq_index);
     }
 
-    if (esp_air->co2_equivalent) {
-        cJSON_AddNumberToObject(root, "co2_equivalent", floor(esp_air->co2_equivalent * 100) / 100);
+    if (esp_air_local->co2_equivalent) {
+        cJSON_AddNumberToObject(root, "co2_equivalent", floor(esp_air_local->co2_equivalent * 100) / 100);
     }
 
-    if (esp_air->breath_voc_equivalent) {
-        cJSON_AddNumberToObject(root, "breath_voc_equivalent", floor(esp_air->breath_voc_equivalent * 100) / 100);
+    if (esp_air_local->breath_voc_equivalent) {
+        cJSON_AddNumberToObject(root, "breath_voc_equivalent", floor(esp_air_local->breath_voc_equivalent * 100) / 100);
+    }
+
+    if (esp_air_local->co) {
+        cJSON_AddNumberToObject(root, "co", floor(esp_air_local->co * 100) / 100);
+    }
+
+    if (esp_air_local->co2) {
+        cJSON_AddNumberToObject(root, "co2", floor(esp_air_local->co2 * 100) / 100);
+    }
+
+    if (esp_air_local->co2_index) {
+        cJSON_AddNumberToObject(root, "co2_index", esp_air_local->co2_index);
     }
 
     json = cJSON_PrintUnformatted(root);
@@ -323,11 +426,11 @@ void user_bsec_state_save(const uint8_t *state_buffer, uint32_t length)
     nvs_close(nvs);
 }
 
-void build_air_quality_index(esp_air_t *esp_air) {
+void build_air_quality_index(esp_air_t *esp_air_local) {
     enum AIR_QUALITY_INDEX index = AIR_QUALITY_NULL;
-    double score = esp_air->iaq;
+    double score = esp_air_local->iaq;
 
-    if (esp_air->iaq) {
+    if (esp_air_local->iaq) {
         if      (score >= 301)                  index = AIR_QUALITY_HAZARDOUS;
         else if (score >= 201 && score <= 300 ) index = AIR_QUALITY_VERY_UNHEALTHY;
         else if (score >= 176 && score <= 200 ) index = AIR_QUALITY_UNHEALTHY;
@@ -336,14 +439,27 @@ void build_air_quality_index(esp_air_t *esp_air) {
         else if (score >=  00 && score <=  50 ) index = AIR_QUALITY_GOOD;
     }
 
-    esp_air->iaq_index = index;
+    esp_air_local->iaq_index = index;
+}
+
+void build_co2_index(esp_air_t *esp_air_local) {
+    enum CO2_INDEX index = CO2_NULL;
+    double score = esp_air_local->co2;
+
+    if (score) {
+        if      (score >= 1400)                 index = CO2_HAZARDOUS;
+        else if (score >= 1000 && score < 1400) index = CO2_UNHEALTHY;
+        else if (score >= 800 && score < 1000)  index = CO2_MODERATE;
+        else if (score < 800)                   index = CO2_GOOD;
+    }
+
+    esp_air_local->co2_index = index;
 }
 
 void user_output_ready(int64_t timestamp, float iaq, uint8_t iaq_accuracy, float temperature, float humidity,
         float pressure, float raw_temperature, float raw_humidity, float gas, bsec_library_return_t bsec_status,
         float static_iaq, float co2_equivalent, float breath_voc_equivalent)
 {
-    esp_air_t esp_air;
     esp_air.temperature = temperature;
     esp_air.humidity = humidity;
     esp_air.pressure = 0.01f * pressure;
@@ -358,6 +474,110 @@ void user_output_ready(int64_t timestamp, float iaq, uint8_t iaq_accuracy, float
     xEventGroupSetBits(esp_event_group, CONNECTED_BIT);
 }
 
+uint8_t uart_checksum(uint8_t *data, size_t size)
+{
+    uint8_t sum = 0;
+    for(size_t i = 1; i < 8; i++)
+    {
+        sum += data[i];
+    }
+
+    return ~sum + 1;
+}
+
+esp_err_t uart_read_co(uint8_t *data, size_t size, esp_air_t *esp_air_local) {
+    if (size != CO_MESSAGE_LENGTH) { return ESP_FAIL; }
+    if (data[CO_GAS_TYPE_BYTE] != CO_TYPE) { return ESP_FAIL; }
+    if (data[CO_CHECK_SUM_BYTE] != uart_checksum(data, size)) { return ESP_FAIL; }
+
+    esp_air_local->co = (data[CO_HIGH_BYTE] * 256 + data[CO_LOW_BYTE]) * 0.1;
+    return ESP_OK;
+}
+
+esp_err_t uart_read_co2(uint8_t *data, size_t size, esp_air_t *esp_air_local) {
+    if (size != CO2_MESSAGE_LENGTH) { return ESP_FAIL; }
+    if (data[CO2_SENSOR_BYTE] != CO2_TYPE) { return ESP_FAIL; }
+    if (data[CO2_CHECK_SUM_BYTE] != uart_checksum(data, size)) { return ESP_FAIL; }
+
+    esp_air_local->co2 = (data[CO2_HIGH_BYTE] * 256 + data[CO2_LOW_BYTE]);
+    return ESP_OK;
+}
+
+void task_co_receive(void *param)
+{
+    uart_event_t event;
+    uint8_t* data = (uint8_t*) malloc(UART_CO_BUF_SIZE);
+
+    while(true) {
+        xQueueReceive(esp_uart_co_queue, &event, portMAX_DELAY);
+        bzero(data, UART_CO_BUF_SIZE);
+
+        switch(event.type) {
+            case UART_DATA:
+                uart_read_bytes(UART_NUM_1, data, event.size, portMAX_DELAY);
+                esp_err_t err = uart_read_co(data, event.size, &esp_air);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "[UART][CO] Received unsupported data %d", event.size);
+                    break;
+                }
+                xQueueSend(esp_air_queue, &esp_air, portMAX_DELAY);
+                xEventGroupSetBits(esp_event_group, CONNECTED_BIT);
+                break;
+            case UART_FIFO_OVF:
+            case UART_BUFFER_FULL:
+                uart_flush_input(UART_NUM_1);
+                xQueueReset(esp_uart_co_queue);
+                break;
+            default:
+                ESP_LOGE(TAG, "[UART][CO] Event ID %d", event.type);
+                break;
+        }
+    }
+}
+
+void task_co2_receive(void *param)
+{
+    uart_event_t event;
+    uint8_t* data = (uint8_t*) malloc(UART_CO2_BUF_SIZE);
+
+    while(true) {
+        xQueueReceive(esp_uart_co2_queue, &event, portMAX_DELAY);
+        bzero(data, UART_CO2_BUF_SIZE);
+
+        switch(event.type) {
+            case UART_DATA:
+                uart_read_bytes(UART_NUM_2, data, event.size, portMAX_DELAY);
+                esp_err_t err = uart_read_co2(data, event.size, &esp_air);
+                if (err != ESP_OK) {
+                    ESP_LOGI(TAG, "[UART][CO2] Received unsupported data %d", event.size);
+                    break;
+                }
+                build_co2_index(&esp_air);
+                xQueueSend(esp_air_queue, &esp_air, portMAX_DELAY);
+                xEventGroupSetBits(esp_event_group, CONNECTED_BIT);
+                break;
+            case UART_FIFO_OVF:
+            case UART_BUFFER_FULL:
+                uart_flush_input(UART_NUM_2);
+                xQueueReset(esp_uart_co2_queue);
+                break;
+            default:
+                ESP_LOGE(TAG, "[UART][CO2] Event ID %d", event.type);
+                break;
+        }
+    }
+}
+
+void task_co2_poll(void *param)
+{
+    uint8_t data[9] = { 0xFF, 0x01, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x79 };
+
+    while(true) {
+        uart_write_bytes(UART_NUM_2, (const char *) data, sizeof(data));
+        vTaskDelay(10000 / portTICK_PERIOD_MS);
+    }
+}
+
 void task_air_retrieve(void *param)
 {
     bsec_iot_loop(user_delay_ms, user_time_us, user_output_ready, user_bsec_state_save, 10000);
@@ -365,13 +585,13 @@ void task_air_retrieve(void *param)
 
 void task_air_publish(void *param)
 {
-    esp_air_t esp_air;
+    esp_air_t esp_air_local;
     char *json;
 
     while(true) {
         xEventGroupWaitBits(mqtt_event_group, CONNECTED_BIT, false, true, portMAX_DELAY);
-        xQueueReceive(esp_air_queue, &esp_air, portMAX_DELAY);
-        json = serialize_esp_air(&esp_air);
+        xQueueReceive(esp_air_queue, &esp_air_local, portMAX_DELAY);
+        json = serialize_esp_air(&esp_air_local);
         ESP_LOGI(TAG, "[MQTT] Publish data %.*s", strlen(json), json);
         esp_mqtt_client_publish(client, MQTT_STATE_TOPIC, json, 0, 0, true);
         free(json);
@@ -489,7 +709,6 @@ void app_main()
     esp_log_level_set("*", ESP_LOG_INFO);
     esp_log_level_set("esp-tls", ESP_LOG_VERBOSE);
     esp_log_level_set("MQTT_CLIENT", ESP_LOG_VERBOSE);
-    esp_log_level_set("MQTT_EXAMPLE", ESP_LOG_VERBOSE);
     esp_log_level_set("TRANSPORT_TCP", ESP_LOG_VERBOSE);
     esp_log_level_set("TRANSPORT_SSL", ESP_LOG_VERBOSE);
     esp_log_level_set("TRANSPORT", ESP_LOG_VERBOSE);
@@ -510,7 +729,7 @@ void app_main()
     res = i2c_master_init();
 
     if (res != ESP_OK) {
-        ESP_LOGE(TAG, "Driver install error: %d", res);
+        ESP_LOGE(TAG, "I2C driver install error: %d", res);
         exit(1);
     }
 
@@ -521,6 +740,18 @@ void app_main()
     }
     else if (ret.bsec_status) {
         ESP_LOGE(TAG, "Initialize BSEC error %d", res);
+        exit(1);
+    }
+
+    res = uart_co_init();
+    if (res != ESP_OK) {
+        ESP_LOGE(TAG, "UART driver CO install error: %d", res);
+        exit(1);
+    }
+
+    res = uart_co2_init();
+    if (res != ESP_OK) {
+        ESP_LOGE(TAG, "UART driver CO2 install error: %d", res);
         exit(1);
     }
 
@@ -537,7 +768,10 @@ void app_main()
         exit(1);
     }
 
-    xTaskCreate(&task_air_retrieve, "task_air_retrieve",  4096, NULL, 0, NULL);
+    xTaskCreate(task_air_retrieve, "task_air_retrieve",  4096, NULL, 0, NULL);
     xTaskCreate(task_air_publish, "task_air_publish", 4096, NULL, 0, NULL);
     xTaskCreate(task_esp_publish, "task_esp_publish", 4096, NULL, 0, NULL);
+    xTaskCreate(task_co_receive, "task_co_receive", 4096, NULL, 0, NULL);
+    xTaskCreate(task_co2_poll, "task_co2_poll", 4096, NULL, 0, NULL);
+    xTaskCreate(task_co2_receive, "task_co2_receive", 4096, NULL, 0, NULL);
 }
