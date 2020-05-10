@@ -31,11 +31,18 @@ typedef struct {
 } esp_air_t;
 
 typedef struct {
+    double co;
+} esp_air_co_t;
+
+typedef struct {
     enum CO2_INDEX co2_index;
     double co2;
 } esp_air_co2_t;
 
 void build_air_quality_index(esp_air_t *esp_air);
 char* serialize_esp_air(esp_air_t *esp_air);
+
+char* serialize_esp_air_co(esp_air_co_t *esp_air);
+
 void build_co2_index(esp_air_co2_t *esp_air);
 char* serialize_esp_air_co2(esp_air_co2_t *esp_air);

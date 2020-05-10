@@ -61,6 +61,19 @@ char* serialize_esp_air(esp_air_t *esp_air) {
     return json;
 }
 
+char* serialize_esp_air_co(esp_air_co_t *esp_air) {
+    char *json = NULL;
+    cJSON *root = cJSON_CreateObject();
+
+    if (esp_air->co) {
+        cJSON_AddNumberToObject(root, "co", floor(esp_air->co * 100) / 100);
+    }
+
+    json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return json;
+}
+
 void build_co2_index(esp_air_co2_t *esp_air) {
     enum CO2_INDEX index = CO2_NULL;
     double score = esp_air->co2;

@@ -27,7 +27,7 @@
 #include "bsec_integration.h"
 #include "bsec_serialized_configurations_iaq.h"
 
-static QueueHandle_t esp_air_queue, esp_air_co2_queue, esp_uart_co2_queue;
+static QueueHandle_t esp_air_queue, esp_air_co2_queue, esp_air_co_queue, esp_uart_co_queue, esp_uart_co2_queue;
 static EventGroupHandle_t wifi_event_group, mqtt_event_group, esp_event_group;
 static esp_mqtt_client_handle_t client;
 
@@ -42,17 +42,26 @@ const char *STATUS_ONLINE = "online";
 const char *STATUS_OFFLINE = "offline";
 
 const char *MQTT_DEVICE_TOPIC = "discovery/sensor/espressif";
-const char *MQTT_STATE_IAQ_PATH   = "state/iaq";
-const char *MQTT_STATE_CO2_PATH   = "state/co2";
-const char *MQTT_STATUS_PATH  = "status";
-const char *MQTT_ATTRS_PATH   = "attributes";
+const char *MQTT_STATE_IAQ_PATH = "state/iaq";
+const char *MQTT_STATE_CO_PATH = "state/co";
+const char *MQTT_STATE_CO2_PATH = "state/co2";
+const char *MQTT_STATUS_PATH = "status";
+const char *MQTT_ATTRS_PATH = "attributes";
 
 char *MQTT_STATE_IAQ_TOPIC;
+char *MQTT_STATE_CO_TOPIC;
 char *MQTT_STATE_CO2_TOPIC;
 char *MQTT_STATUS_TOPIC;
 char *MQTT_ATTRS_TOPIC;
 
 #define MQTT_PUBLISH_DELAY 5000
+
+#define CO_GAS_TYPE_BYTE  1
+#define CO_HIGH_BYTE      4
+#define CO_LOW_BYTE       5
+#define CO_CHECK_SUM_BYTE 8
+#define CO_MESSAGE_LENGTH 9
+#define CO_TYPE           0x04
 
 #define CO2_SENSOR_BYTE    1
 #define CO2_CHECK_SUM_BYTE 8
@@ -61,9 +70,16 @@ char *MQTT_ATTRS_TOPIC;
 #define CO2_MESSAGE_LENGTH 9
 #define CO2_TYPE           0x86
 
+#define UART_CO_BAUD_RATE              9600
+#define UART_CO_BUF_SIZE               256
+#define UART_CO_QUEUE_SIZE             128
+
 #define UART_CO2_BAUD_RATE              9600
 #define UART_CO2_BUF_SIZE               256
 #define UART_CO2_QUEUE_SIZE             128
+
+#define UART_CO_TXD   23
+#define UART_CO_RXD   22
 
 #define UART_CO2_TXD   16
 #define UART_CO2_RXD   17
@@ -77,6 +93,8 @@ char *MQTT_ATTRS_TOPIC;
 
 #define SERIAL_KEY                  "serial"
 #define SERIAL_LENGTH               8
+
+#define DEFINE_CO_SENSOR
 
 static uint8_t serial[SERIAL_LENGTH];
 
@@ -298,7 +316,7 @@ void task_air_publish(void *param)
     }
 }
 
-void task_air_co2_publish(void *param)
+void task_co2_publish(void *param)
 {
     TickType_t last_tick = 0;
     TickType_t tick = 0;
@@ -320,7 +338,6 @@ void task_air_co2_publish(void *param)
             last_tick = tick;
         }
 
-        xEventGroupSetBits(esp_event_group, CONNECTED_BIT);
         json = serialize_esp_air_co2(&esp_air_local);
         ESP_LOGI(TAG, "[MQTT] Publish topic %.*s data %.*s", strlen(MQTT_STATE_CO2_TOPIC), MQTT_STATE_CO2_TOPIC, strlen(json), json);
         esp_mqtt_client_publish(client, MQTT_STATE_CO2_TOPIC, json, 0, 0, true);
@@ -463,32 +480,136 @@ void ensure_mqtt_topics(void) {
     serial_hex(&hex);
 
     MQTT_STATE_IAQ_TOPIC = malloc(strlen(MQTT_DEVICE_TOPIC) + strlen(hex) + strlen(MQTT_STATE_IAQ_PATH) + 1);
+    MQTT_STATE_CO_TOPIC = malloc(strlen(MQTT_DEVICE_TOPIC) + strlen(hex) + strlen(MQTT_STATE_CO_PATH) + 1);
     MQTT_STATE_CO2_TOPIC = malloc(strlen(MQTT_DEVICE_TOPIC) + strlen(hex) + strlen(MQTT_STATE_CO2_PATH) + 1);
     MQTT_STATUS_TOPIC = malloc(strlen(MQTT_DEVICE_TOPIC) + strlen(hex) + strlen(MQTT_STATUS_PATH) + 1);
     MQTT_ATTRS_TOPIC = malloc(strlen(MQTT_DEVICE_TOPIC) + strlen(hex) + strlen(MQTT_ATTRS_PATH) + 1);
 
     char *ps = MQTT_STATE_IAQ_TOPIC;
+    char *po = MQTT_STATE_CO_TOPIC;
     char *pc = MQTT_STATE_CO2_TOPIC;
     char *pt = MQTT_STATUS_TOPIC;
     char *pa = MQTT_ATTRS_TOPIC;
 
     ps += sprintf(ps, "%s", MQTT_DEVICE_TOPIC);
+    po += sprintf(po, "%s", MQTT_DEVICE_TOPIC);
     pc += sprintf(pc, "%s", MQTT_DEVICE_TOPIC);
     pt += sprintf(pt, "%s", MQTT_DEVICE_TOPIC);
     pa += sprintf(pa, "%s", MQTT_DEVICE_TOPIC);
 
     ps += sprintf(ps, "/%s/", hex);
+    po += sprintf(po, "/%s/", hex);
     pc += sprintf(pc, "/%s/", hex);
     pt += sprintf(pt, "/%s/", hex);
     pa += sprintf(pa, "/%s/", hex);
 
     strcpy(ps, MQTT_STATE_IAQ_PATH);
+    strcpy(po, MQTT_STATE_CO_PATH);
     strcpy(pc, MQTT_STATE_CO2_PATH);
     strcpy(pt, MQTT_STATUS_PATH);
     strcpy(pa, MQTT_ATTRS_PATH);
 
     free(hex);
 }
+
+#ifdef DEFINE_CO_SENSOR
+esp_air_co_t esp_air_co = {};
+
+esp_err_t uart_co_init()
+{
+    esp_err_t err;
+    uart_config_t uart_config = {
+            .baud_rate = UART_CO_BAUD_RATE,
+            .data_bits = UART_DATA_8_BITS,
+            .parity = UART_PARITY_DISABLE,
+            .stop_bits = UART_STOP_BITS_1,
+            .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+            .source_clk = UART_SCLK_APB,
+    };
+
+    err = uart_param_config(UART_NUM_1, &uart_config);
+    if (err != ESP_OK) { return err; }
+
+    err = uart_driver_install(UART_NUM_1, UART_FIFO_LEN * 2, UART_FIFO_LEN * 2, UART_CO_QUEUE_SIZE, &esp_uart_co_queue, 0);
+    if (err != ESP_OK) { return err; }
+
+    err = uart_set_pin(UART_NUM_1, UART_CO_TXD, UART_CO_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (err != ESP_OK) { return err; }
+
+    err = uart_pattern_queue_reset(UART_NUM_1, UART_CO_QUEUE_SIZE);
+    return err;
+}
+
+esp_err_t uart_read_co(uint8_t *data, size_t size, esp_air_co_t *esp_air_local) {
+    if (size != CO_MESSAGE_LENGTH) { return ESP_FAIL; }
+    if (data[CO_GAS_TYPE_BYTE] != CO_TYPE) { return ESP_FAIL; }
+    if (data[CO_CHECK_SUM_BYTE] != uart_checksum(data, size)) { return ESP_FAIL; }
+
+    esp_air_local->co = (data[CO_HIGH_BYTE] * 256 + data[CO_LOW_BYTE]) * 0.1;
+    return ESP_OK;
+}
+
+void task_co_receive(void *param)
+{
+    uart_event_t event;
+    uint8_t* data = (uint8_t*) malloc(UART_CO_BUF_SIZE);
+
+    while(true) {
+        xQueueReceive(esp_uart_co_queue, &event, portMAX_DELAY);
+        bzero(data, UART_CO_BUF_SIZE);
+
+        switch(event.type) {
+            case UART_DATA:
+                uart_read_bytes(UART_NUM_1, data, event.size, portMAX_DELAY);
+                esp_err_t err = uart_read_co(data, event.size, &esp_air_co);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "[UART][CO] Received unsupported data %d", event.size);
+                    break;
+                }
+                xQueueSend(esp_air_co_queue, &esp_air_co, portMAX_DELAY);
+                break;
+            case UART_FIFO_OVF:
+            case UART_BUFFER_FULL:
+                uart_flush_input(UART_NUM_1);
+                xQueueReset(esp_uart_co_queue);
+                break;
+            default:
+                ESP_LOGE(TAG, "[UART][CO] Event ID %d", event.type);
+                break;
+        }
+    }
+}
+
+void task_co_publish(void *param)
+{
+    TickType_t last_tick = 0;
+    TickType_t tick = 0;
+    uint tick_shift = 0;
+
+    esp_air_co_t esp_air_local;
+    char *json;
+
+    while(true) {
+        xEventGroupWaitBits(mqtt_event_group, CONNECTED_BIT, false, true, portMAX_DELAY);
+        xQueueReceive(esp_air_co_queue, &esp_air_local, portMAX_DELAY);
+
+        tick = xTaskGetTickCount();
+        tick_shift = (tick - last_tick) * portTICK_RATE_MS;
+
+        if (last_tick && tick_shift < MQTT_PUBLISH_DELAY) {
+            continue;
+        } else {
+            last_tick = tick;
+        }
+
+        json = serialize_esp_air_co(&esp_air_local);
+        ESP_LOGI(TAG, "[MQTT] Publish topic %.*s data %.*s", strlen(MQTT_STATE_CO_TOPIC), MQTT_STATE_CO_TOPIC, strlen(json), json);
+        esp_mqtt_client_publish(client, MQTT_STATE_CO_TOPIC, json, 0, 0, true);
+
+        free(json);
+    }
+}
+#endif
 
 void app_main()
 {
@@ -500,13 +621,8 @@ void app_main()
     ESP_LOGI(TAG, "[APP] IDF version: %s", esp_get_idf_version());
 
     esp_log_level_set("*", ESP_LOG_INFO);
-    esp_log_level_set("esp-tls", ESP_LOG_VERBOSE);
-    esp_log_level_set("MQTT_CLIENT", ESP_LOG_VERBOSE);
-    esp_log_level_set("TRANSPORT_TCP", ESP_LOG_VERBOSE);
-    esp_log_level_set("TRANSPORT_SSL", ESP_LOG_VERBOSE);
-    esp_log_level_set("TRANSPORT", ESP_LOG_VERBOSE);
-    esp_log_level_set("OUTBOX", ESP_LOG_VERBOSE);
-    esp_log_level_set(TAG, ESP_LOG_VERBOSE);
+    esp_log_level_set("esp-tls", ESP_LOG_INFO);
+    esp_log_level_set(TAG, ESP_LOG_INFO);
 
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -561,8 +677,25 @@ void app_main()
 
     xTaskCreate(task_air_retrieve, "task_air_retrieve",  4096, NULL, 0, NULL);
     xTaskCreate(task_air_publish, "task_air_publish", 4096, NULL, 0, NULL);
-    xTaskCreate(task_air_co2_publish, "task_air_co2_publish", 4096, NULL, 0, NULL);
     xTaskCreate(task_esp_publish, "task_esp_publish", 4096, NULL, 0, NULL);
     xTaskCreate(task_co2_poll, "task_co2_poll", 4096, NULL, 0, NULL);
     xTaskCreate(task_co2_receive, "task_co2_receive", 4096, NULL, 0, NULL);
+    xTaskCreate(task_co2_publish, "task_air_co2_publish", 4096, NULL, 0, NULL);
+
+#ifdef DEFINE_CO_SENSOR
+    res = uart_co_init();
+    if (res != ESP_OK) {
+        ESP_LOGE(TAG, "UART driver CO install error: %d", res);
+        exit(1);
+    }
+
+    esp_air_co_queue = xQueueCreate(AIR_QUEUE_SIZE, sizeof(esp_air_co_t));
+    if (esp_air_co_queue == NULL) {
+        ESP_LOGE(TAG, "Error initialize env data queue");
+        exit(1);
+    }
+
+    xTaskCreate(task_co_receive, "task_co_receive", 4096, NULL, 0, NULL);
+    xTaskCreate(task_co_publish, "task_co_publish", 4096, NULL, 0, NULL);
+#endif
 }
