@@ -94,7 +94,7 @@ char *MQTT_ATTRS_TOPIC;
 #define SERIAL_KEY                  "serial"
 #define SERIAL_LENGTH               8
 
-#define DEFINE_CO_SENSOR
+//#define DEFINE_CO_SENSOR
 
 static uint8_t serial[SERIAL_LENGTH];
 
@@ -357,7 +357,6 @@ static void mqtt_app_start(void) {
             .username = CONFIG_MQTT_USERNAME,
             .password = CONFIG_MQTT_PASSWORD,
             .event_handle = mqtt_event_handler,
-            .cert_pem = (const char *) ca_cert_pem_start,
             .lwt_topic = MQTT_STATUS_TOPIC,
             .lwt_msg = STATUS_OFFLINE,
             .lwt_qos = 0,
